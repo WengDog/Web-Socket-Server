@@ -78,8 +78,8 @@ class API():
     def set_fn_message_received(self, fn):
         self.message_received = fn
 
-    def send_message(self, client, msg):
-        self._unicast_(client, msg)
+    def send_message(self, client, msg, opcode):
+        self._unicast_(client, msg, opcode)
     
     def send_file(self, client):
         self._unicast_binary_(client)
@@ -146,8 +146,8 @@ class WebsocketServer(ThreadingMixIn, TCPServer, API):
         if client in self.clients:
             self.clients.remove(client)
 
-    def _unicast_(self, to_client, msg):
-        to_client['handler'].send_message(msg)
+    def _unicast_(self, to_client, msg, opcode):
+        to_client['handler'].send_message(msg, opcode)
     
     def _unicast_binary_(self, to_client):
         to_client['handler'].send_binary()
@@ -218,7 +218,7 @@ class WebSocketHandler(StreamRequestHandler):
             logger.warn("Continuation frames are not supported.")
             return
         elif opcode == OPCODE_BINARY:
-            logger.warn("Binary frames are not supported.")
+            logger.warn("Binary frames are on.")
             return
         elif opcode == OPCODE_TEXT:
             opcode_handler = self.server._message_received_
@@ -243,8 +243,8 @@ class WebSocketHandler(StreamRequestHandler):
             message_bytes.append(message_byte)
         opcode_handler(self, message_bytes.decode('utf8'))
 
-    def send_message(self, message):
-        self.send_text(message)
+    def send_message(self, message, opcode):
+        self.send_text(message, opcode)
 
     def send_file(self):
         self.send_binary()
@@ -252,28 +252,16 @@ class WebSocketHandler(StreamRequestHandler):
     def send_pong(self, message):
         self.send_text(message, OPCODE_PONG)
 
-    def send_text(self, message, opcode=OPCODE_TEXT):
+    def send_text(self, message, opcode):
         """
         Important: Fragmented(=continuation) messages are not supported since
         their usage cases are limited - when we don't know the payload length.
         """
-
-        # Validate message
-        if isinstance(message, bytes):
-            message = try_decode_UTF8(message)  # this is slower but ensures we have UTF-8
-            if not message:
-                logger.warning("Can\'t send message, message is not valid UTF-8")
-                return False
-        elif sys.version_info < (3,0) and (isinstance(message, str) or isinstance(message, unicode)):
-            pass
-        elif isinstance(message, str):
-            pass
-        else:
-            logger.warning('Can\'t send message, message has to be a string or bytes. Given type is %s' % type(message))
-            return False
-
         header  = bytearray()
-        payload = encode_to_UTF8(message)
+        if opcode == 0x1 or opcode == 0xA:
+            payload = message.encode('utf-8')
+        elif opcode == 0x2: 
+            payload = message
         payload_length = len(payload)
 
         # Normal payload
@@ -293,10 +281,6 @@ class WebSocketHandler(StreamRequestHandler):
             header.append(PAYLOAD_LEN_EXT64)
             header.extend(struct.pack(">Q", payload_length))
 
-        else:
-            raise Exception("Message is too big. Consider breaking it into chunks.")
-            return
-
         self.request.send(header + payload)
     
     def send_binary(self):
@@ -305,21 +289,24 @@ class WebSocketHandler(StreamRequestHandler):
         payload_data = f.read(125)
 
         start_file =True
-
+        count = 0
         while(payload_data):
+            print(count)
             next_payload_data = f.read(125)
 
             if(start_file):
                 if(len(next_payload_data) != 0):
                     header = b"\x02\x7D"
                 else:
-                    header = b"\x82\x7D"
+                    payload_len = int(len(payload_data))
+                    header = b"\x82" + chr(payload_len)
             else:
                 if(len(next_payload_data) != 0):
                     header = b"\x00\x7D"
                 else:
-                    header = b"\x80\x7D" 
-            
+                    payload_len = int(len(payload_data))
+                    header = b"\x80" + chr(payload_len) 
+            count +=1
             start_file = False
 
             # mengirim paket binary frame ke client
