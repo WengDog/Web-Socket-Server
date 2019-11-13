@@ -7,9 +7,6 @@ from socket import error as SocketError
 import errno
 from socketserver import ThreadingMixIn, TCPServer, StreamRequestHandler
 
-logger = logging.getLogger(__name__)
-logging.basicConfig()
-
 FIN    = 0x80
 OPCODE = 0x0f
 MASKED = 0x80
@@ -25,59 +22,51 @@ OPCODE_PING         = 0x9
 OPCODE_PONG         = 0xA
 
 # API untuk menjalankan server web socket
-class API():
-
+class API:
     def run_forever(self):
         try:
-            logger.info("Listening on port %d for clients.." % self.port)
             self.serve_forever()
         except KeyboardInterrupt:
             self.server_close()
-            logger.info("Server terminated.")
         except Exception as e:
-            logger.error(str(e), exc_info=True)
             exit(1)
-
-    def new_client(self, client, server):
-        pass
-
-    def client_left(self, client, server):
-        pass
 
     def message_received(self, client, server, message):
         pass
 
-    def set_fn_new_client(self, fn):
-        self.new_client = fn
+    def binary_received(self, client, server, message):
+        pass
 
-    def set_fn_client_left(self, fn):
-        self.client_left = fn
+    def continuation_received(self, client, server, message):
+        pass
 
     def set_fn_message_received(self, fn):
         self.message_received = fn
+    
+    def set_fn_binary_received(self, fn):
+        self.binary_received = fn
+    
+    def set_fn_continuation_received(self, fn):
+        self.continuation_received = fn
 
-    def send_message(self, client, msg, opcode):
-        self._unicast_(client, msg, opcode)
-
-    def send_message_to_all(self, msg):
-        self._multicast_(msg)
-
+    
 # Kelas untuk web socket server yang dapat menghandle beberapa client
 class WebsocketServer(ThreadingMixIn, TCPServer, API):
-    allow_reuse_address = True
-    daemon_threads = True  # untuk membuat thread tetap berjalan hingga selesai
-
-    # tempat penampungan untuk client
+    # tempat queue untuk client
     clients = []
-    id_counter = 0
 
-    def __init__(self, port, host='127.0.0.1', loglevel=logging.WARNING):
-        logger.setLevel(loglevel)
+    def __init__(self, port, host='0.0.0.0'):
         TCPServer.__init__(self, (host, port), WebSocketHandler)
         self.port = self.socket.getsockname()[1]
 
     def _message_received_(self, handler, msg):
         self.message_received(self.handler_to_client(handler), self, msg)
+    
+    def _binary_received_(self, handler, msg):
+        self.binary_received(self.handler_to_client(handler), self, msg)
+
+    def _continuation_received_(self, handler, msg):
+        self.continuation_received(self.handler_to_client(handler), self, msg)
 
     def _ping_received_(self, handler, msg):
         handler.send_pong(msg)
@@ -86,28 +75,23 @@ class WebsocketServer(ThreadingMixIn, TCPServer, API):
         pass
 
     def _new_client_(self, handler):
-        self.id_counter += 1
         client = {
-            'id': self.id_counter,
             'handler': handler,
             'address': handler.client_address
         }
         self.clients.append(client)
-        self.new_client(client, self)
 
     def _client_left_(self, handler):
         client = self.handler_to_client(handler)
-        self.client_left(client, self)
         if client in self.clients:
             self.clients.remove(client)
 
-    def _unicast_(self, to_client, msg, opcode):
-        to_client['handler'].send_message(msg, opcode)
-
-    def _multicast_(self, msg):
-        for client in self.clients:
-            self._unicast_(client, msg)
-
+    def _unicast_(self, to_client, msg):
+        to_client['handler'].send_message(msg)
+    
+    def _binary_unicast_(self, to_client, msg):
+        to_client['handler'].send_binary(msg)
+    
     def handler_to_client(self, handler):
         for client in self.clients:
             if client['handler'] == handler:
@@ -123,8 +107,8 @@ class WebSocketHandler(StreamRequestHandler):
     def setup(self):
         StreamRequestHandler.setup(self)
         self.keep_alive = True
-        self.handshake_done = False
         self.valid_client = False
+        self.handshake_done = False
 
     def handle(self):
         while self.keep_alive:
@@ -134,38 +118,35 @@ class WebSocketHandler(StreamRequestHandler):
                 self.read_next_data()
 
     def read_bytes(self, num):
-        bytes = self.rfile.read(num)
-        return bytes
+        byte = self.rfile.read(num)
+        return byte
 
     def read_next_data(self):
         # melakukan pembacaan bytes data dari client
         try:
             b1, b2 = self.read_bytes(2)
         except SocketError as e: 
-            if e.errno == errno.ECONNRESET:
-                logger.info("Client closed connection.")
-                self.keep_alive = 0
-                return
             b1, b2 = 0, 0
         except ValueError as e:
             b1, b2 = 0, 0
-
+        
+        # mengambil nilai FIN, OPCODE dan PAYLOAD LENGTH
         fin    = b1 & FIN
         opcode = b1 & OPCODE
         masked = b2 & MASKED
         payload_length = b2 & PAYLOAD_LEN
 
+        print(opcode)
+
+        # jika client ingin close connection
         if opcode == OPCODE_CLOSE_CONN:
+            print("Client disconected")
             self.keep_alive = 0
             return
-        if not masked:
-            self.keep_alive = 0
-            return
-        if opcode == OPCODE_CONTINUATION:
-            return
-        elif opcode == OPCODE_BINARY:
-            opcode_handler = self.server._message_received_
-            return
+        
+        # handle berdasarkan tipe frame
+        if opcode == OPCODE_BINARY:
+            opcode_handler = self.server._binary_received_
         elif opcode == OPCODE_TEXT:
             opcode_handler = self.server._message_received_
         elif opcode == OPCODE_PING:
@@ -173,7 +154,7 @@ class WebSocketHandler(StreamRequestHandler):
         elif opcode == OPCODE_PONG:
             opcode_handler = self.server._pong_received_
         else:
-            logger.warn("Unknown opcode %#x." % opcode)
+            # koneksi diputus
             self.keep_alive = 0
             return
 
@@ -183,15 +164,38 @@ class WebSocketHandler(StreamRequestHandler):
         elif payload_length == 127:
             payload_length = struct.unpack(">Q", self.rfile.read(8))[0]
 
-        masks = self.read_bytes(4)
-        message_bytes = bytearray()
-        for message_byte in self.read_bytes(payload_length):
-            message_byte ^= masks[len(message_bytes) % 4]
-            message_bytes.append(message_byte)
-        opcode_handler(self, message_bytes.decode('utf8'))
+        if masked:
+            # encode payload text dengan mask
+            masks = self.read_bytes(4)
+            message_bytes = bytearray()
+            for message_byte in self.read_bytes(payload_length):
+                message_byte ^= masks[len(message_bytes) % 4]
+                message_bytes.append(message_byte)
+        else:
+            message_bytes = bytearray()
+            for message_byte in self.read_bytes(payload_length):
+                message_bytes.append(message_byte)
 
-    def send_message(self, message, opcode):
-        self.send_text(message, opcode)
+        # handle untuk paket yang lebih dari 1 frame
+        temp = b''
+        if opcode == OPCODE_CONTINUATION:
+            temp += message_bytes
+            opcode_handler = self.server._continuation_received_
+        
+        if opcode == OPCODE_BINARY:
+            opcode_handler(self, message_bytes)
+        elif opcode == OPCODE_CONTINUATION and fin == 1:
+            # hapus jika paket frame sudah dilengkap dan telah diproses server
+            opcode_handler(self, temp)
+            temp = b''
+        elif opcode == OPCODE_PONG or opcode == OPCODE_PING or opcode == OPCODE_TEXT:
+            opcode_handler(self, message_bytes.decode('utf8'))
+
+    def send_message(self, message):
+        self.send_text(message, OPCODE_TEXT)
+
+    def send_binary(self, message):
+        self.send_text(message, OPCODE_BINARY)
 
     def send_pong(self, message):
         self.send_text(message, OPCODE_PONG)
@@ -199,24 +203,20 @@ class WebSocketHandler(StreamRequestHandler):
     def send_text(self, message, opcode):
         header  = bytearray()
 
-        if opcode == 0x1 or opcode == 0xA:
-            payload = message.encode('utf-8')
-        elif opcode == 0x2: 
+        if opcode == OPCODE_BINARY: 
             payload = message
+        elif opcode == OPCODE_TEXT or opcode == OPCODE_PONG:
+            payload = message.encode('utf-8')
         payload_length = len(payload)
 
-        # Normal payload
+        # handle panjang payload
         if payload_length <= 125:
             header.append(FIN | opcode)
             header.append(payload_length)
-
-        # Extended payload
-        elif payload_length >= 126 and payload_length <= 65535:
+        elif payload_length > 125 and payload_length <= 65536:
             header.append(FIN | opcode)
             header.append(PAYLOAD_LEN_EXT16)
             header.extend(struct.pack(">H", payload_length))
-
-        # Huge extended payload
         elif payload_length < 18446744073709551616:
             header.append(FIN | opcode)
             header.append(PAYLOAD_LEN_EXT64)
@@ -229,6 +229,7 @@ class WebSocketHandler(StreamRequestHandler):
         # baris pertama harus http GET
         http_get = self.rfile.readline().decode().strip()
         assert http_get.upper().startswith('GET')
+
         # setelahnya harus header
         while True:
             header = self.rfile.readline().decode().strip()
@@ -251,23 +252,26 @@ class WebSocketHandler(StreamRequestHandler):
         try:
             key = headers['sec-websocket-key']
         except KeyError:
-            logger.warning("Client tried to connect but was missing a key")
             self.keep_alive = False
             return
 
-        response = \
-          'HTTP/1.1 101 Switching Protocols\r\n'\
-          'Upgrade: websocket\r\n'              \
-          'Connection: Upgrade\r\n'             \
-          'Sec-WebSocket-Accept: %s\r\n'        \
-          '\r\n' % self.make_key(key)
+        response = self.make_handshake_response(key)
 
         self.handshake_done = self.request.send(response.encode())
         self.valid_client = True
         self.server._new_client_(self)
 
     @classmethod
-    # Fungsi untuk membuat key response sesuai standar rtf
+    def make_handshake_response(cls, key):
+        return \
+          'HTTP/1.1 101 Switching Protocols\r\n'\
+          'Upgrade: websocket\r\n'              \
+          'Connection: Upgrade\r\n'             \
+          'Sec-WebSocket-Accept: %s\r\n'        \
+          '\r\n' % cls.make_key(key)
+
+    @classmethod
+    # Fungsi untuk membuat key response sesuai standar rfc
     def make_key(cls, key):
         GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
         hash = sha1(key.encode() + GUID.encode())
